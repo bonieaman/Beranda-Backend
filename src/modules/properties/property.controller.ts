@@ -18,6 +18,102 @@ const getNumberParam = (param: any): number | undefined => {
   return isNaN(num) ? undefined : num;
 };
 
+const getIntegerParam = (param: any, fieldName: string): { value?: number; error?: string } => {
+  const str = getStringParam(param);
+  if (str === undefined || str.trim() === "") return {};
+  if (!/^\d+$/.test(str.trim())) {
+    return { error: `${fieldName} must be a whole number greater than or equal to 0` };
+  }
+  const num = Number(str);
+  if (!Number.isSafeInteger(num) || num < 0) {
+    return { error: `${fieldName} must be a whole number greater than or equal to 0` };
+  }
+  return { value: num };
+};
+
+const parseOptionalInteger = (value: any, fieldName: string): { value: number | null; error?: string } => {
+  if (value === undefined || value === null || value === "") return { value: null };
+  if (typeof value === "string" && value.trim() === "") return { value: null };
+
+  const num = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(num) || num < 0) {
+    return { value: null, error: `${fieldName} must be a whole number greater than or equal to 0` };
+  }
+
+  return { value: num };
+};
+
+const AMENITY_ALIASES: Record<string, string> = {
+  "wi-fi": "WiFi",
+  "wifi": "WiFi",
+  "wi fi": "WiFi",
+  "parking": "Free parking",
+  "free parking": "Free parking",
+  "air conditioning": "Air conditioning",
+  "air conditioner": "Air conditioning",
+  "ac": "Air conditioning",
+  "a/c": "Air conditioning",
+  "pet friendly": "Pet friendly",
+  "pets allowed": "Pet friendly",
+  "dedicated workspace": "Dedicated workspace",
+  "workspace": "Dedicated workspace",
+  "desk": "Dedicated workspace",
+  "hot water": "Hot water",
+  "hotwater": "Hot water",
+};
+
+const normalizeAmenityName = (value: string): string => {
+  const collapsed = value.trim().replace(/\s+/g, " ");
+  const key = collapsed.toLowerCase();
+  return AMENITY_ALIASES[key] || collapsed;
+};
+
+const parseAmenityNames = (amenities: any): { names: string[]; error?: string } => {
+  if (amenities === undefined || amenities === null) return { names: [] };
+  if (!Array.isArray(amenities)) return { names: [], error: "Amenities must be an array of names" };
+
+  const names: string[] = [];
+  const seen = new Set<string>();
+
+  for (const item of amenities) {
+    const rawName =
+      typeof item === "string"
+        ? item
+        : typeof item?.amenity?.name === "string"
+          ? item.amenity.name
+          : typeof item?.name === "string"
+            ? item.name
+            : "";
+
+    const name = normalizeAmenityName(rawName);
+    if (!name) continue;
+    if (name.length > 80) return { names: [], error: "Amenity names must be 80 characters or fewer" };
+
+    const key = name.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      names.push(name);
+    }
+  }
+
+  return { names };
+};
+
+const syncPropertyAmenities = async (client: any, propertyId: string, names: string[]) => {
+  await client.propertyAmenity.deleteMany({ where: { propertyId } });
+
+  for (const name of names) {
+    const existingAmenity = await client.amenity.findFirst({
+      where: { name: { equals: name, mode: "insensitive" } },
+    });
+    const amenity = existingAmenity || await client.amenity.create({ data: { name } });
+
+    await client.propertyAmenity.create({
+      data: { propertyId, amenityId: amenity.id },
+    });
+  }
+};
+
 // Helper to safely get ID from params
 const getIdParam = (param: any): string | undefined => {
   if (param === undefined || param === null) return undefined;
@@ -66,9 +162,12 @@ export const getProperties = async (req: Request, res: Response) => {
     }
 
     // Bedrooms filter
-    const bedroomsNum = getNumberParam(bedrooms);
-    if (bedroomsNum !== undefined && bedroomsNum > 0) {
-      where.bedrooms = { gte: bedroomsNum };
+    const bedroomsParsed = getIntegerParam(bedrooms, "Bedrooms");
+    if (bedroomsParsed.error) {
+      return res.status(400).json({ success: false, message: bedroomsParsed.error });
+    }
+    if (bedroomsParsed.value !== undefined && bedroomsParsed.value > 0) {
+      where.bedrooms = { gte: bedroomsParsed.value };
     }
 
     // Date availability filter
@@ -92,7 +191,7 @@ export const getProperties = async (req: Request, res: Response) => {
     // Amenities filter — must have ALL selected amenities
     const amenitiesStr = getStringParam(amenities);
     if (amenitiesStr) {
-      const amenityList = amenitiesStr.split(',').map(a => a.trim()).filter(Boolean);
+      const amenityList = parseAmenityNames(amenitiesStr.split(',')).names;
       if (amenityList.length > 0) {
         where.AND = [
           ...(where.AND || []),
@@ -126,6 +225,11 @@ export const getProperties = async (req: Request, res: Response) => {
             where: { mediaType: 'image' },
             take: 1,
             select: { mediaUrl: true }
+          },
+          amenities: {
+            select: {
+              amenity: { select: { id: true, name: true } }
+            }
           },
           _count: { select: { reviews: true } }
         },
@@ -171,7 +275,7 @@ export const getProperties = async (req: Request, res: Response) => {
 // SEARCH PROPERTIES
 export const searchProperties = async (req: Request, res: Response) => {
   try {
-    const { q, location, minPrice, maxPrice, checkIn, checkOut, bedrooms } = req.query;
+    const { q, location, minPrice, maxPrice, checkIn, checkOut, bedrooms, amenities } = req.query;
 
     const where: any = {
       deletedAt: null,
@@ -185,7 +289,10 @@ export const searchProperties = async (req: Request, res: Response) => {
     const maxPriceNum = getNumberParam(maxPrice);
     const checkInStr = getStringParam(checkIn);
     const checkOutStr = getStringParam(checkOut);
-    const bedroomsNum = getNumberParam(bedrooms);
+    const bedroomsParsed = getIntegerParam(bedrooms, "Bedrooms");
+    if (bedroomsParsed.error) {
+      return res.status(400).json({ success: false, message: bedroomsParsed.error });
+    }
 
     // Text search
     if (qStr && qStr.trim()) {
@@ -209,8 +316,8 @@ export const searchProperties = async (req: Request, res: Response) => {
     }
 
     // Bedrooms
-    if (bedroomsNum !== undefined && bedroomsNum > 0) {
-      where.bedrooms = { gte: bedroomsNum };
+    if (bedroomsParsed.value !== undefined && bedroomsParsed.value > 0) {
+      where.bedrooms = { gte: bedroomsParsed.value };
     }
 
     // Date availability
@@ -229,11 +336,33 @@ export const searchProperties = async (req: Request, res: Response) => {
       };
     }
 
+    const amenitiesStr = getStringParam(amenities);
+    if (amenitiesStr) {
+      const amenityList = parseAmenityNames(amenitiesStr.split(',')).names;
+      if (amenityList.length > 0) {
+        where.AND = [
+          ...(where.AND || []),
+          ...amenityList.map(name => ({
+            amenities: {
+              some: {
+                amenity: { name: { equals: name, mode: 'insensitive' } }
+              }
+            }
+          }))
+        ];
+      }
+    }
+
     const properties = await prisma.property.findMany({
       where,
       include: {
         owner: { select: { fullName: true, email: true } },
         media: { where: { mediaType: 'image' }, take: 1, select: { mediaUrl: true } },
+        amenities: {
+          select: {
+            amenity: { select: { id: true, name: true } }
+          }
+        },
         _count: { select: { reviews: true } }
       },
       orderBy: { createdAt: 'desc' },
@@ -329,6 +458,7 @@ export const createProperty = async (req: Request, res: Response) => {
       maxGuests,
       area,
       isDraft,
+      amenities,
     } = req.body;
 
     const ownerId = (req as any).user?.userId || (req as any).user?.id;
@@ -348,24 +478,45 @@ export const createProperty = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: "A title is required to save a draft" });
     }
 
-    const newProperty = await prisma.property.create({
-      data: {
-        title,
-        description: description || "",
-        location: location || "",
-        latitude: latitude ? parseFloat(latitude) : 0,
-        longitude: longitude ? parseFloat(longitude) : 0,
-        monthlyPrice: monthlyPrice ? parseFloat(monthlyPrice) : 0,
-        bedrooms: bedrooms ? parseInt(bedrooms) : null,
-        bathrooms: bathrooms ? parseFloat(bathrooms) : null,
-        maxGuests: maxGuests ? parseInt(maxGuests) : null,
-        area: area ? parseFloat(area) : null,
-        ownerId,
-        approvalStatus: isDraft ? 'draft' : 'pending',
-      },
-      include: {
-        media: true
+    const bedroomsParsed = parseOptionalInteger(bedrooms, "Bedrooms");
+    if (bedroomsParsed.error) {
+      return res.status(400).json({ success: false, message: bedroomsParsed.error });
+    }
+
+    const amenitiesParsed = parseAmenityNames(amenities);
+    if (amenitiesParsed.error) {
+      return res.status(400).json({ success: false, message: amenitiesParsed.error });
+    }
+
+    const newProperty = await prisma.$transaction(async (tx) => {
+      const property = await tx.property.create({
+        data: {
+          title,
+          description: description || "",
+          location: location || "",
+          latitude: latitude ? parseFloat(latitude) : 0,
+          longitude: longitude ? parseFloat(longitude) : 0,
+          monthlyPrice: monthlyPrice ? parseFloat(monthlyPrice) : 0,
+          bedrooms: bedroomsParsed.value,
+          bathrooms: bathrooms ? parseFloat(bathrooms) : null,
+          maxGuests: maxGuests ? parseInt(maxGuests) : null,
+          area: area ? parseFloat(area) : null,
+          ownerId,
+          approvalStatus: isDraft ? 'draft' : 'pending',
+        },
+      });
+
+      if (amenitiesParsed.names.length > 0) {
+        await syncPropertyAmenities(tx, property.id, amenitiesParsed.names);
       }
+
+      return tx.property.findUnique({
+        where: { id: property.id },
+        include: {
+          media: true,
+          amenities: { include: { amenity: true } },
+        },
+      });
     });
 
     res.status(201).json({ success: true, data: newProperty });
@@ -397,35 +548,46 @@ export const updateProperty = async (req: Request, res: Response) => {
     // Strip fields that should not be changed directly by property owners
     const { approvalStatus, ownerId: _ownerId, deletedAt: _deletedAt, amenities, ...scalarBody } = req.body;
 
+    const dataToUpdateBase: any = { ...scalarBody };
+    if (Object.prototype.hasOwnProperty.call(req.body, "bedrooms")) {
+      const bedroomsParsed = parseOptionalInteger(req.body.bedrooms, "Bedrooms");
+      if (bedroomsParsed.error) {
+        return res.status(400).json({ success: false, message: bedroomsParsed.error });
+      }
+      dataToUpdateBase.bedrooms = bedroomsParsed.value;
+    }
+
+    const amenitiesParsed: { names: string[]; error?: string } =
+      Array.isArray(amenities) ? parseAmenityNames(amenities) : { names: [] };
+    if (amenitiesParsed.error) {
+      return res.status(400).json({ success: false, message: amenitiesParsed.error });
+    }
+
     // Allow draft → pending transition only (to submit for review)
     const allowedStatusChange =
       approvalStatus === 'pending' && existingProperty.approvalStatus === 'draft';
     const dataToUpdate: any = allowedStatusChange
-      ? { ...scalarBody, approvalStatus: 'pending' as const }
-      : scalarBody;
+      ? { ...dataToUpdateBase, approvalStatus: 'pending' as const }
+      : dataToUpdateBase;
 
-    const updateResult = await prisma.property.update({
-      where: { id },
-      data: dataToUpdate,
-    });
+    const updateResult = await prisma.$transaction(async (tx) => {
+      await tx.property.update({
+        where: { id },
+        data: dataToUpdate,
+      });
 
-    // Update amenities if provided
-    if (Array.isArray(amenities)) {
-      // Delete existing property amenities
-      await prisma.propertyAmenity.deleteMany({ where: { propertyId: id } });
-      // Upsert each amenity and create the join record
-      for (const name of amenities) {
-        if (!name) continue;
-        const amenity = await prisma.amenity.upsert({
-          where: { name },
-          update: {},
-          create: { name },
-        });
-        await prisma.propertyAmenity.create({
-          data: { propertyId: id, amenityId: amenity.id },
-        });
+      if (Array.isArray(amenities)) {
+        await syncPropertyAmenities(tx, id, amenitiesParsed.names);
       }
-    }
+
+      return tx.property.findUnique({
+        where: { id },
+        include: {
+          media: true,
+          amenities: { include: { amenity: true } },
+        },
+      });
+    });
 
     res.status(200).json({ success: true, message: "Property updated successfully", data: updateResult });
   } catch (error: any) {
@@ -485,7 +647,8 @@ export const getUserProperties = async (req: Request, res: Response) => {
             status: { in: ['pending', 'approved', 'confirmed'] }
           },
           take: 5
-        }
+        },
+        amenities: { include: { amenity: true } }
       },
       orderBy: { createdAt: 'desc' },
     });

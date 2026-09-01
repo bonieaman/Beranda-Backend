@@ -178,6 +178,7 @@ model ChatParticipant {
   user   User   @relation(fields: [userId], references: [id])
 
   @@id([chatId, userId])
+  @@index([userId])
   @@map("chat_participants")
 }
 
@@ -192,6 +193,9 @@ model Message {
   chat      Chat     @relation(fields: [chatId], references: [id])
   sender    User     @relation("MessagesSent", fields: [senderId], references: [id])
 
+  @@index([chatId, createdAt])
+  @@index([chatId, readAt])
+  @@index([senderId])
   @@map("messages")
 }
 

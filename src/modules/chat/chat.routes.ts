@@ -7,6 +7,7 @@ import {
   getMessages,
   sendMessage,
   getUnreadCount,
+  streamChatEvents,
 } from "./chat.controller";
 
 const router = Router();
@@ -21,6 +22,7 @@ router.use(verifyToken);
 
 router.get("/", getChats);
 router.get("/unread", getUnreadCount);
+router.get("/events", streamChatEvents);
 router.post("/", createChat);
 router.get("/:id", getChatById);
 router.get("/:id/messages", getMessages);
