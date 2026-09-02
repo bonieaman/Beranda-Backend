@@ -2,6 +2,7 @@
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import prisma from "../../config/prisma";
+import { consumeDigitalIdVerificationToken, DigitalIdValidationError } from "./digitalId.service";
 
 const JWT_SECRET = process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || "superlongrandomaccesssecret";
 const JWT_EXPIRES = process.env.JWT_ACCESS_EXPIRES || "7d";
@@ -12,6 +13,11 @@ interface GoogleTokenPayload {
   name: string;
   picture?: string;
   sub: string;
+}
+
+interface DigitalIdVerificationForUser {
+  verifiedAt: Date;
+  method: string;
 }
 
 /** Role names are stored in mixed case ("USER", "ADMIN", "SUPER_ADMIN").
@@ -37,7 +43,8 @@ export const registerUser = async (
   email: string,
   password: string,
   roleName = "USER",
-  fullName?: string
+  fullName?: string,
+  digitalIdVerification?: DigitalIdVerificationForUser
 ) => {
   // Friendly duplicate-email check before hitting the unique constraint
   const existing = await prisma.user.findUnique({ where: { email } });
@@ -60,12 +67,20 @@ export const registerUser = async (
       fullName: fullName || username,
       username,
       isVerified: true,
+      digitalIdStatus: digitalIdVerification ? "PASSED" : "PENDING",
+      digitalIdVerifiedAt: digitalIdVerification?.verifiedAt || null,
+      digitalIdVerificationMethod: digitalIdVerification?.method || null,
       roles: { create: { roleId: role.id } },
     },
     include: { roles: { include: { role: true } } },
   });
 
   return user;
+};
+
+export const isEmailRegistered = async (email: string) => {
+  const user = await prisma.user.findUnique({ where: { email } });
+  return Boolean(user);
 };
 
 export const loginUser = async (email: string, password: string) => {
@@ -91,7 +106,7 @@ export const loginUser = async (email: string, password: string) => {
   return { user, token };
 };
 
-export const loginWithGoogle = async (idToken: string) => {
+export const loginWithGoogle = async (idToken: string, digitalIdVerificationToken?: string) => {
   const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
   const response = await fetch(
@@ -113,6 +128,15 @@ export const loginWithGoogle = async (idToken: string) => {
   });
 
   if (!user) {
+    const digitalIdVerification = consumeDigitalIdVerificationToken(digitalIdVerificationToken, email);
+    if (!digitalIdVerification) {
+      throw new DigitalIdValidationError(
+        "Digital ID verification is required before creating a new account.",
+        400,
+        "DIGITAL_ID_REQUIRED"
+      );
+    }
+
     const userRole = await findOrCreateRole("USER");
     const randomPass = Math.random().toString(36).slice(-12);
     const hashed = await bcrypt.hash(randomPass, 12);
@@ -131,6 +155,9 @@ export const loginWithGoogle = async (idToken: string) => {
         passwordHash: hashed,
         profileImageUrl: picture,
         isVerified: true,
+        digitalIdStatus: "PASSED",
+        digitalIdVerifiedAt: digitalIdVerification.verifiedAt,
+        digitalIdVerificationMethod: digitalIdVerification.method,
         roles: { create: { roleId: userRole.id } },
       },
       include: { roles: { include: { role: true } } },

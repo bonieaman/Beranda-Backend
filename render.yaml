@@ -2,7 +2,7 @@ services:
   - type: web
     name: berenda-backend
     runtime: node
-    buildCommand: npm install --include=dev && prisma db push && prisma generate && npx tsc
+    buildCommand: npm install --include=dev && prisma generate && npx tsc && prisma migrate deploy
     startCommand: node dist/server.js
     envVars:
       - key: NODE_ENV

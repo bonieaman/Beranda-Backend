@@ -1,5 +1,6 @@
 // backend/src/modules/properties/property.controller.ts
 import { Request, Response } from "express";
+import { Prisma } from "@prisma/client";
 import prisma from "../../lib/prisma";
 
 
@@ -114,6 +115,239 @@ const syncPropertyAmenities = async (client: any, propertyId: string, names: str
   }
 };
 
+const MAX_SEARCH_RESULTS = 50;
+const SEARCH_CANDIDATE_LIMIT = 180;
+const FUZZY_CANDIDATE_LIMIT = 80;
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(Math.max(value, min), max);
+
+const normalizeSearchText = (value: string | undefined) =>
+  String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const getSearchTerms = (value: string) =>
+  normalizeSearchText(value)
+    .split(" ")
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+
+const buildWhereWithAnd = (where: any, clause: any) => ({
+  ...where,
+  AND: [...(Array.isArray(where.AND) ? where.AND : []), clause],
+});
+
+const buildTextSearchFilter = (rawSearchText: string | undefined) => {
+  const normalized = normalizeSearchText(rawSearchText);
+  if (!normalized) return null;
+
+  const terms = getSearchTerms(normalized);
+  const needles = Array.from(new Set([normalized, ...terms]));
+  const containsClauses = needles.flatMap((term) => [
+    { title: { contains: term, mode: "insensitive" } },
+    { location: { contains: term, mode: "insensitive" } },
+    { description: { contains: term, mode: "insensitive" } },
+  ]);
+
+  return {
+    normalized,
+    terms,
+    filter: { OR: containsClauses },
+  };
+};
+
+const tokenizeSearchableText = (value: string) =>
+  getSearchTerms(value).flatMap((term) => term.split(/(?<=\D)(?=\d)|(?<=\d)(?=\D)/));
+
+const editDistanceWithin = (left: string, right: string, maxDistance: number) => {
+  if (Math.abs(left.length - right.length) > maxDistance) return maxDistance + 1;
+
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = new Array(right.length + 1).fill(0);
+
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    let rowMin = current[0];
+
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost
+      );
+      rowMin = Math.min(rowMin, current[j]);
+    }
+
+    if (rowMin > maxDistance) return maxDistance + 1;
+    for (let j = 0; j <= right.length; j += 1) previous[j] = current[j];
+  }
+
+  return previous[right.length];
+};
+
+const isFuzzyTermMatch = (term: string, word: string) => {
+  if (term.length < 3 || word.length < 3) return false;
+  if (word.includes(term) || term.includes(word)) return true;
+
+  const maxDistance = term.length <= 5 ? 1 : 2;
+  return editDistanceWithin(term, word, maxDistance) <= maxDistance;
+};
+
+const scoreField = (
+  fieldValue: string,
+  terms: string[],
+  normalizedQuery: string,
+  weights: { exact: number; prefix: number; wordPrefix: number; partial: number; fuzzy: number }
+) => {
+  const value = normalizeSearchText(fieldValue);
+  if (!value) return { score: 0, matchedTerms: 0 };
+
+  let score = 0;
+  let matchedTerms = 0;
+  const words = tokenizeSearchableText(value);
+
+  if (normalizedQuery) {
+    if (value === normalizedQuery) score += weights.exact;
+    else if (value.startsWith(normalizedQuery)) score += weights.prefix;
+    else if (value.includes(normalizedQuery)) score += weights.partial;
+  }
+
+  for (const term of terms) {
+    if (!term) continue;
+
+    if (value === term) {
+      score += weights.exact;
+      matchedTerms += 1;
+    } else if (value.startsWith(term)) {
+      score += weights.prefix;
+      matchedTerms += 1;
+    } else if (words.some((word) => word.startsWith(term))) {
+      score += weights.wordPrefix;
+      matchedTerms += 1;
+    } else if (value.includes(term)) {
+      score += weights.partial;
+      matchedTerms += 1;
+    } else if (words.some((word) => isFuzzyTermMatch(term, word))) {
+      score += weights.fuzzy;
+      matchedTerms += 1;
+    }
+  }
+
+  return { score, matchedTerms };
+};
+
+const scorePropertySearchMatch = (property: any, rawSearchText: string) => {
+  const normalizedQuery = normalizeSearchText(rawSearchText);
+  const terms = getSearchTerms(normalizedQuery);
+  if (!normalizedQuery || terms.length === 0) return 0;
+
+  const titleScore = scoreField(property.title, terms, normalizedQuery, {
+    exact: 1000,
+    prefix: 760,
+    wordPrefix: 560,
+    partial: 420,
+    fuzzy: 220,
+  });
+  const locationScore = scoreField(property.location, terms, normalizedQuery, {
+    exact: 900,
+    prefix: 700,
+    wordPrefix: 520,
+    partial: 380,
+    fuzzy: 200,
+  });
+  const descriptionScore = scoreField(property.description, terms, normalizedQuery, {
+    exact: 240,
+    prefix: 180,
+    wordPrefix: 120,
+    partial: 80,
+    fuzzy: 0,
+  });
+
+  const matchedTerms = Math.min(
+    terms.length,
+    titleScore.matchedTerms + locationScore.matchedTerms + descriptionScore.matchedTerms
+  );
+  const allTermsMatchedBonus = matchedTerms === terms.length ? 350 : matchedTerms * 35;
+
+  return titleScore.score + locationScore.score + descriptionScore.score + allTermsMatchedBonus;
+};
+
+const rankPropertiesForSearch = (properties: any[], rawSearchText: string) => {
+  const seen = new Set<string>();
+  return properties
+    .filter((property) => {
+      if (seen.has(property.id)) return false;
+      seen.add(property.id);
+      return true;
+    })
+    .map((property) => ({
+      property,
+      score: scorePropertySearchMatch(property, rawSearchText),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      return new Date(right.property.createdAt).getTime() - new Date(left.property.createdAt).getTime();
+    })
+    .map((item) => item.property);
+};
+
+const getFuzzyCandidateIds = async (terms: string[]) => {
+  const fuzzyTerms = terms.filter((term) => term.length >= 3).slice(0, 5);
+  if (fuzzyTerms.length === 0) return [];
+
+  const conditions = fuzzyTerms.map((term) => Prisma.sql`
+    similarity(lower(p."title"), ${term}) >= 0.25
+    OR similarity(lower(p."location"), ${term}) >= 0.25
+    OR EXISTS (
+      SELECT 1
+      FROM regexp_split_to_table(lower(concat_ws(' ', p."title", p."location")), '\\s+') AS word
+      WHERE similarity(word, ${term}) >= 0.45
+    )
+  `);
+
+  try {
+    const rows = await prisma.$queryRaw<{ id: string }[]>(Prisma.sql`
+      SELECT p."id"
+      FROM "properties" p
+      WHERE p."deletedAt" IS NULL
+        AND p."approvalStatus" = 'approved'
+        AND p."isAvailable" = true
+        AND (${Prisma.join(conditions, " OR ")})
+      LIMIT ${FUZZY_CANDIDATE_LIMIT}
+    `);
+
+    return rows.map((row) => row.id);
+  } catch {
+    return [];
+  }
+};
+
+const attachRatings = async (properties: any[]) => {
+  const propertyIds = properties.map((property) => property.id);
+  const ratingAggs = propertyIds.length > 0
+    ? await prisma.review.groupBy({
+        by: ['propertyId'],
+        where: { propertyId: { in: propertyIds } },
+        _avg: { rating: true },
+      })
+    : [];
+  const ratingMap = Object.fromEntries(ratingAggs.map((rating) => [rating.propertyId, rating._avg.rating]));
+
+  return properties.map((property) => ({
+    ...property,
+    averageRating: ratingMap[property.id] ?? null,
+    reviewsCount: property._count.reviews,
+  }));
+};
+
 // Helper to safely get ID from params
 const getIdParam = (param: any): string | undefined => {
   if (param === undefined || param === null) return undefined;
@@ -145,11 +379,9 @@ export const getProperties = async (req: Request, res: Response) => {
 
     // Location filter
     const locationStr = getStringParam(location);
-    if (locationStr && locationStr.trim()) {
-      where.location = {
-        contains: locationStr.trim(),
-        mode: 'insensitive'
-      };
+    const locationSearch = buildTextSearchFilter(locationStr);
+    if (locationSearch) {
+      where.AND = [...(where.AND || []), locationSearch.filter];
     }
 
     // Price range filter
@@ -240,22 +472,7 @@ export const getProperties = async (req: Request, res: Response) => {
       prisma.property.count({ where })
     ]);
 
-    // Fetch avg ratings in one aggregation query
-    const propertyIds = properties.map(p => p.id);
-    const ratingAggs = propertyIds.length > 0
-      ? await prisma.review.groupBy({
-          by: ['propertyId'],
-          where: { propertyId: { in: propertyIds } },
-          _avg: { rating: true },
-        })
-      : [];
-    const ratingMap = Object.fromEntries(ratingAggs.map(r => [r.propertyId, r._avg.rating]));
-
-    const propertiesWithRating = properties.map(property => ({
-      ...property,
-      averageRating: ratingMap[property.id] ?? null,
-      reviewsCount: property._count.reviews,
-    }));
+    const propertiesWithRating = await attachRatings(properties);
 
     res.status(200).json({ 
       success: true, 
@@ -275,7 +492,7 @@ export const getProperties = async (req: Request, res: Response) => {
 // SEARCH PROPERTIES
 export const searchProperties = async (req: Request, res: Response) => {
   try {
-    const { q, location, minPrice, maxPrice, checkIn, checkOut, bedrooms, amenities } = req.query;
+    const { q, location, minPrice, maxPrice, checkIn, checkOut, bedrooms, amenities, limit, offset } = req.query;
 
     const where: any = {
       deletedAt: null,
@@ -294,19 +511,8 @@ export const searchProperties = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: bedroomsParsed.error });
     }
 
-    // Text search
-    if (qStr && qStr.trim()) {
-      where.OR = [
-        { title: { contains: qStr, mode: 'insensitive' } },
-        { description: { contains: qStr, mode: 'insensitive' } },
-        { location: { contains: qStr, mode: 'insensitive' } },
-      ];
-    }
-
-    // Location filter
-    if (locationStr && locationStr.trim()) {
-      where.location = { contains: locationStr, mode: 'insensitive' };
-    }
+    const rawSearchText = [qStr, locationStr].filter((value) => value && value.trim()).join(" ");
+    const textSearch = buildTextSearchFilter(rawSearchText);
 
     // Price range
     if (minPriceNum !== undefined || maxPriceNum !== undefined) {
@@ -353,42 +559,88 @@ export const searchProperties = async (req: Request, res: Response) => {
       }
     }
 
-    const properties = await prisma.property.findMany({
-      where,
-      include: {
-        owner: { select: { fullName: true, email: true } },
-        media: { where: { mediaType: 'image' }, take: 1, select: { mediaUrl: true } },
-        amenities: {
-          select: {
-            amenity: { select: { id: true, name: true } }
-          }
-        },
-        _count: { select: { reviews: true } }
+    const include = {
+      owner: { select: { id: true, fullName: true, email: true, profileImageUrl: true } },
+      media: { where: { mediaType: 'image' }, take: 1, select: { mediaUrl: true } },
+      amenities: {
+        select: {
+          amenity: { select: { id: true, name: true } }
+        }
       },
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-    });
+      _count: { select: { reviews: true } }
+    } as const;
 
-    const searchIds = properties.map(p => p.id);
-    const searchRatingAggs = searchIds.length > 0
-      ? await prisma.review.groupBy({
-          by: ['propertyId'],
-          where: { propertyId: { in: searchIds } },
-          _avg: { rating: true },
-        })
-      : [];
-    const searchRatingMap = Object.fromEntries(searchRatingAggs.map(r => [r.propertyId, r._avg.rating]));
+    const limitNum = clamp(Math.floor(getNumberParam(limit) || 20), 1, MAX_SEARCH_RESULTS);
+    const offsetNum = Math.max(0, Math.floor(getNumberParam(offset) || 0));
+    let properties: any[] = [];
+    let total = 0;
 
-    const propertiesWithRating = properties.map(property => ({
-      ...property,
-      averageRating: searchRatingMap[property.id] ?? null,
-      reviewsCount: property._count.reviews,
-    }));
+    if (textSearch) {
+      const minimumNeeded = offsetNum + limitNum;
+      const candidateTake = clamp(minimumNeeded * 6, limitNum, SEARCH_CANDIDATE_LIMIT);
+      const partialWhere = buildWhereWithAnd(where, textSearch.filter);
 
-    res.json({ success: true, count: properties.length, data: propertiesWithRating });
+      const partialCandidates = await prisma.property.findMany({
+        where: partialWhere,
+        include,
+        orderBy: { createdAt: 'desc' },
+        take: candidateTake,
+      });
+
+      let candidates = partialCandidates;
+      const seenIds = new Set(candidates.map((property) => property.id));
+
+      if (candidates.length < minimumNeeded) {
+        const fuzzyIds = (await getFuzzyCandidateIds(textSearch.terms)).filter((id) => !seenIds.has(id));
+        if (fuzzyIds.length > 0) {
+          const fuzzyCandidates = await prisma.property.findMany({
+            where: {
+              ...where,
+              id: { in: fuzzyIds },
+            },
+            include,
+            take: candidateTake,
+          });
+          fuzzyCandidates.forEach((property) => seenIds.add(property.id));
+          candidates = [...candidates, ...fuzzyCandidates];
+        }
+      }
+
+      if (candidates.length < minimumNeeded && textSearch.terms.some((term) => term.length >= 3)) {
+        const fallbackCandidates = await prisma.property.findMany({
+          where: {
+            ...where,
+            id: { notIn: Array.from(seenIds) },
+          },
+          include,
+          orderBy: { createdAt: 'desc' },
+          take: candidateTake,
+        });
+        candidates = [...candidates, ...fallbackCandidates];
+      }
+
+      const rankedProperties = rankPropertiesForSearch(candidates, rawSearchText);
+      total = rankedProperties.length;
+      properties = rankedProperties.slice(offsetNum, offsetNum + limitNum);
+    } else {
+      [properties, total] = await Promise.all([
+        prisma.property.findMany({
+          where,
+          include,
+          orderBy: { createdAt: 'desc' },
+          take: limitNum,
+          skip: offsetNum,
+        }),
+        prisma.property.count({ where })
+      ]);
+    }
+
+    const propertiesWithRating = await attachRatings(properties);
+
+    res.json({ success: true, count: properties.length, total, data: propertiesWithRating });
   } catch (error) {
     console.error('Error searching properties:', error);
-    res.status(500).json({ message: 'Search failed' });
+    res.status(500).json({ success: false, message: 'Search failed' });
   }
 };
 

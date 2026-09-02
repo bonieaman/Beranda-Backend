@@ -18,6 +18,9 @@ model User {
   passwordHash     String
   profileImageUrl  String?
   isVerified       Boolean           @default(false)
+  digitalIdStatus  DigitalIdStatus   @default(PENDING)
+  digitalIdVerifiedAt DateTime?
+  digitalIdVerificationMethod String?
   settings         Json?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
@@ -32,6 +35,7 @@ model User {
   reviews          Review[]
   roles            UserRole[]
 
+  @@index([digitalIdStatus])
   @@map("users")
 }
 
@@ -65,7 +69,7 @@ model Property {
   longitude      Float
   monthlyPrice   Float
   bedrooms       Int?                   // Add this
-  bathrooms      Float?                 // Add this  
+  bathrooms      Float?                 // Add this
   area           Float?                 // Add this
   maxGuests      Int?                   // Add this
   isAvailable    Boolean                @default(true)
@@ -230,7 +234,7 @@ model Payment {
   id              String        @id @default(uuid())
   bookingId       String
   booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  txRef           String        @unique 
+  txRef           String        @unique
   amount          Float
   status          PaymentStatus @default(pending)
   checkoutUrl     String?
@@ -269,4 +273,10 @@ enum PropertyApprovalStatus {
 enum MediaTypeEnum {
   image
   video
+}
+
+enum DigitalIdStatus {
+  PENDING
+  PASSED
+  FAILED
 }
