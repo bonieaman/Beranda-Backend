@@ -20,6 +20,26 @@ interface DigitalIdVerificationForUser {
   method: string;
 }
 
+interface GoogleLoginOptions {
+  digitalIdVerificationToken?: string;
+  allowSignup?: boolean;
+}
+
+export class AuthenticationError extends Error {
+  statusCode: number;
+  status: number;
+  code: string;
+
+  constructor(message = "Unable to sign in.", statusCode = 401, code = "AUTH_FAILED") {
+    super(message);
+    this.statusCode = statusCode;
+    this.status = statusCode;
+    this.code = code;
+  }
+}
+
+const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
 /** Role names are stored in mixed case ("USER", "ADMIN", "SUPER_ADMIN").
  *  This helper normalises before comparison so nothing breaks if the DB
  *  ever has an inconsistency. */
@@ -46,14 +66,18 @@ export const registerUser = async (
   fullName?: string,
   digitalIdVerification?: DigitalIdVerificationForUser
 ) => {
+  const normalizedEmail = normalizeEmail(email);
+
   // Friendly duplicate-email check before hitting the unique constraint
-  const existing = await prisma.user.findUnique({ where: { email } });
+  const existing = await prisma.user.findFirst({
+    where: { email: { equals: normalizedEmail, mode: "insensitive" } },
+  });
   if (existing) throw new Error("An account with this email already exists. Please log in instead.");
 
   const hashedPassword = await bcrypt.hash(password, 12);
   const role = await findOrCreateRole(roleName);
 
-  const usernameBase = email.split("@")[0].replace(/[^a-zA-Z0-9_]/g, "");
+  const usernameBase = normalizedEmail.split("@")[0].replace(/[^a-zA-Z0-9_]/g, "");
   let username = usernameBase;
   let suffix = 1;
   while (await prisma.user.findUnique({ where: { username } })) {
@@ -62,7 +86,7 @@ export const registerUser = async (
 
   const user = await prisma.user.create({
     data: {
-      email,
+      email: normalizedEmail,
       passwordHash: hashedPassword,
       fullName: fullName || username,
       username,
@@ -79,20 +103,22 @@ export const registerUser = async (
 };
 
 export const isEmailRegistered = async (email: string) => {
-  const user = await prisma.user.findUnique({ where: { email } });
+  const user = await prisma.user.findFirst({
+    where: { email: { equals: normalizeEmail(email), mode: "insensitive" } },
+  });
   return Boolean(user);
 };
 
 export const loginUser = async (email: string, password: string) => {
-  const user = await prisma.user.findUnique({
-    where: { email },
+  const user = await prisma.user.findFirst({
+    where: { email: { equals: normalizeEmail(email), mode: "insensitive" } },
     include: { roles: { include: { role: true } } },
   });
 
-  if (!user) throw new Error("Invalid credentials");
+  if (!user) throw new AuthenticationError("Incorrect email or password.", 401, "INVALID_CREDENTIALS");
 
   const isMatch = await bcrypt.compare(password, user.passwordHash);
-  if (!isMatch) throw new Error("Invalid credentials");
+  if (!isMatch) throw new AuthenticationError("Incorrect email or password.", 401, "INVALID_CREDENTIALS");
 
   const roleNames = user.roles.map((r) => r.role.name);
   const payload = {
@@ -106,29 +132,38 @@ export const loginUser = async (email: string, password: string) => {
   return { user, token };
 };
 
-export const loginWithGoogle = async (idToken: string, digitalIdVerificationToken?: string) => {
+export const loginWithGoogle = async (idToken: string, options: GoogleLoginOptions = {}) => {
   const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
   const response = await fetch(
     `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`
   );
-  if (!response.ok) throw new Error("Invalid Google ID token");
+  if (!response.ok) throw new AuthenticationError("Unable to sign in with Google.", 401, "INVALID_GOOGLE_TOKEN");
 
   const gPayload = (await response.json()) as GoogleTokenPayload;
   if (GOOGLE_CLIENT_ID && gPayload.aud !== GOOGLE_CLIENT_ID) {
-    throw new Error("Google ID token audience mismatch");
+    throw new AuthenticationError("Unable to sign in with Google.", 401, "GOOGLE_AUDIENCE_MISMATCH");
   }
 
-  const { email, name: fullName = "", picture } = gPayload;
-  if (!email) throw new Error("Google token did not contain email");
+  const { name: fullName = "", picture } = gPayload;
+  const email = gPayload.email ? normalizeEmail(gPayload.email) : "";
+  if (!email) throw new AuthenticationError("Unable to sign in with Google.", 401, "GOOGLE_EMAIL_MISSING");
 
-  let user = await prisma.user.findUnique({
-    where: { email },
+  let user = await prisma.user.findFirst({
+    where: { email: { equals: email, mode: "insensitive" } },
     include: { roles: { include: { role: true } } },
   });
 
   if (!user) {
-    const digitalIdVerification = consumeDigitalIdVerificationToken(digitalIdVerificationToken, email);
+    if (!options.allowSignup) {
+      throw new AuthenticationError(
+        "No account found for this Google sign-in. Please create an account first.",
+        404,
+        "GOOGLE_ACCOUNT_NOT_FOUND"
+      );
+    }
+
+    const digitalIdVerification = consumeDigitalIdVerificationToken(options.digitalIdVerificationToken, email);
     if (!digitalIdVerification) {
       throw new DigitalIdValidationError(
         "Digital ID verification is required before creating a new account.",

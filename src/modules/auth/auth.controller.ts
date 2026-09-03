@@ -9,6 +9,26 @@ import {
   verifyDigitalIdImage,
 } from "./digitalId.service";
 
+const sendAuthError = (res: Response, error: any) => {
+  if (error instanceof AuthService.AuthenticationError) {
+    return res.status(error.statusCode).json({
+      success: false,
+      code: error.code,
+      message: error.message,
+    });
+  }
+
+  if (error instanceof DigitalIdValidationError) {
+    return res.status(error.statusCode).json({
+      success: false,
+      code: error.code,
+      message: error.message,
+    });
+  }
+
+  return null;
+};
+
 // Gmail-only validation for NEW registrations.
 // Login intentionally skips this so existing admin/system accounts can log in.
 const isGmailAddress = (email: string) =>
@@ -66,6 +86,8 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
       roles: user.roles?.map((r) => ({ name: r.role.name })) || [],
     });
   } catch (err: any) {
+    const handled = sendAuthError(res, err);
+    if (handled) return;
     next(err);
   }
 };
@@ -101,18 +123,23 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
       },
     });
   } catch (err: any) {
+    const handled = sendAuthError(res, err);
+    if (handled) return;
     next(err);
   }
 };
 
 export const googleLogin = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { idToken, digitalIdVerificationToken } = req.body;
+    const { idToken, digitalIdVerificationToken, authIntent } = req.body;
     if (!idToken) {
       return res.status(400).json({ success: false, message: "idToken is required" });
     }
 
-    const { user, token } = await AuthService.loginWithGoogle(idToken, digitalIdVerificationToken);
+    const { user, token } = await AuthService.loginWithGoogle(idToken, {
+      digitalIdVerificationToken,
+      allowSignup: authIntent === "register",
+    });
 
     sendResponse(res, 200, "Login successful", {
       token,
@@ -131,6 +158,8 @@ export const googleLogin = async (req: Request, res: Response, next: NextFunctio
       },
     });
   } catch (err: any) {
+    const handled = sendAuthError(res, err);
+    if (handled) return;
     next(err);
   }
 };
@@ -162,9 +191,17 @@ export const verifyDigitalId = async (req: Request, res: Response) => {
       });
     }
 
+    console.error("[digital-id] controller diagnostic", {
+      reason: "unexpected_controller_error",
+      hasFile: Boolean(req.file),
+      mimeType: (req.file as Express.Multer.File | undefined)?.mimetype,
+      fileSizeBytes: (req.file as Express.Multer.File | undefined)?.size,
+      errorName: error?.name || "Error",
+    });
+
     return res.status(500).json({
       success: false,
-      message: "Digital ID screening is temporarily unavailable. Please try again later.",
+      message: "Digital ID verification is temporarily unavailable. Please try again.",
     });
   }
 };

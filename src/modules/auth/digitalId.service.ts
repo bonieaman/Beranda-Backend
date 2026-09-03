@@ -1,23 +1,26 @@
 import crypto from "crypto";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  GoogleGenerativeAI,
+  GoogleGenerativeAIAbortError,
+  GoogleGenerativeAIFetchError,
+  GoogleGenerativeAIRequestInputError,
+  GoogleGenerativeAIResponseError,
+} from "@google/generative-ai";
 
 export const DIGITAL_ID_UPLOAD_FIELD = "digitalIdImage";
 export const DIGITAL_ID_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
 
+const DIGITAL_ID_TEMPORARY_UNAVAILABLE_MESSAGE =
+  "Digital ID verification is temporarily unavailable. Please try again.";
 const MIN_FILE_SIZE_BYTES = 12 * 1024;
 const MIN_WIDTH = 600;
 const MIN_HEIGHT = 350;
 const TOKEN_TTL_MS = 15 * 60 * 1000;
 const ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 const MAX_ATTEMPTS_PER_WINDOW = 6;
-const OCR_MODEL = process.env.DIGITAL_ID_OCR_MODEL || "gemini-2.5-flash";
-const OCR_TIMEOUT_MS = Math.min(
-  Math.max(Number(process.env.DIGITAL_ID_OCR_TIMEOUT_MS) || 12000, 1000),
-  30000
-);
-const DIGITAL_ID_VERIFICATION_MODE =
-  process.env.DIGITAL_ID_VERIFICATION_MODE ||
-  (process.env.NODE_ENV === "test" || process.env.CI === "true" ? "local-image-check" : "ocr");
+const DEFAULT_OCR_MODEL = "gemini-3.5-flash-lite";
+const GEMINI_API_VERSION = "v1beta";
+const MAX_OCR_OUTPUT_TOKENS = 180;
 
 type ImageKind = "image/jpeg" | "image/png" | "image/webp";
 
@@ -46,6 +49,11 @@ interface VerificationRecord {
   method: string;
 }
 
+interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
 export class DigitalIdValidationError extends Error {
   statusCode: number;
   status: number;
@@ -58,6 +66,268 @@ export class DigitalIdValidationError extends Error {
     this.code = code;
   }
 }
+
+const createTemporaryUnavailableError = (code: string, statusCode = 503) =>
+  new DigitalIdValidationError(DIGITAL_ID_TEMPORARY_UNAVAILABLE_MESSAGE, statusCode, code);
+
+const getOcrModel = () => {
+  const configuredModel = process.env.DIGITAL_ID_OCR_MODEL?.trim();
+  return {
+    model: configuredModel || DEFAULT_OCR_MODEL,
+    source: configuredModel ? "DIGITAL_ID_OCR_MODEL" : "default",
+  };
+};
+
+const getOcrTimeoutMs = () =>
+  Math.min(
+    Math.max(Number(process.env.DIGITAL_ID_OCR_TIMEOUT_MS) || 12000, 1000),
+    30000
+  );
+
+const getDigitalIdVerificationMode = () =>
+  process.env.DIGITAL_ID_VERIFICATION_MODE ||
+  (process.env.NODE_ENV === "test" || process.env.CI === "true" ? "local-image-check" : "ocr");
+
+const getGeminiApiKey = () => {
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  if (geminiKey) return { apiKey: geminiKey, source: "GEMINI_API_KEY" };
+
+  const legacyKey = process.env.GOOGLE_AI_API_KEY?.trim();
+  if (legacyKey) return { apiKey: legacyKey, source: "GOOGLE_AI_API_KEY" };
+
+  return { apiKey: "", source: "none" };
+};
+
+const getExternalStatus = (error: any) =>
+  Number(error?.status || error?.statusCode || error?.response?.status || 0) || undefined;
+
+const getExternalReason = (error: any) => {
+  const details = Array.isArray(error?.errorDetails) ? error.errorDetails : [];
+  const reason = details
+    .map((detail: any) => detail?.reason || detail?.metadata?.reason)
+    .find((value: unknown) => typeof value === "string" && value.trim());
+
+  return reason ? String(reason) : undefined;
+};
+
+const getClassifiableErrorText = (error: any) => {
+  const details = Array.isArray(error?.errorDetails) ? error.errorDetails : [];
+  return [
+    error?.message,
+    error?.statusText,
+    ...details.map((detail: any) =>
+      [
+        detail?.reason,
+        detail?.domain,
+        detail?.metadata?.method,
+        detail?.metadata?.service,
+        detail?.metadata?.model,
+      ].filter(Boolean).join(" ")
+    ),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+};
+
+const classifyGeminiError = (error: any) => {
+  const status = getExternalStatus(error);
+  const upstreamReason = getExternalReason(error);
+  const message = getClassifiableErrorText(error);
+  const name = String(error?.name || "");
+
+  if (
+    error instanceof GoogleGenerativeAIAbortError ||
+    name === "AbortError" ||
+    message.includes("request aborted") ||
+    message.includes("timeout") ||
+    message.includes("timed out")
+  ) {
+    return {
+      code: "OCR_TIMEOUT",
+      reason: "timeout",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    status === 429 ||
+    message.includes("quota") ||
+    message.includes("rate limit") ||
+    message.includes("rate_limit") ||
+    message.includes("resource exhausted")
+  ) {
+    return {
+      code: "OCR_QUOTA_OR_RATE_LIMIT",
+      reason: "quota_or_rate_limit",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    status === 404 ||
+    message.includes("model not found") ||
+    message.includes("not found for api version") ||
+    message.includes("not supported for generatecontent") ||
+    message.includes("unsupported model") ||
+    (message.includes("model") && message.includes("unsupported"))
+  ) {
+    return {
+      code: "OCR_MODEL_UNAVAILABLE",
+      reason: "unsupported_or_unavailable_model",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    status === 400 &&
+    (message.includes("api key") ||
+      message.includes("key not valid") ||
+      message.includes("api_key_invalid") ||
+      message.includes("apikey"))
+  ) {
+    return {
+      code: "OCR_INVALID_API_KEY",
+      reason: "invalid_api_key",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    status === 401 ||
+    status === 403 ||
+    message.includes("permission denied") ||
+    message.includes("authentication") ||
+    message.includes("unauthenticated")
+  ) {
+    return {
+      code: "OCR_INVALID_API_KEY",
+      reason: "invalid_api_key",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (status && status >= 500) {
+    return {
+      code: "OCR_UPSTREAM_UNAVAILABLE",
+      reason: "gemini_upstream_failure",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    error instanceof GoogleGenerativeAIResponseError ||
+    message.includes("text not available") ||
+    message.includes("blocked")
+  ) {
+    return {
+      code: "OCR_RESPONSE_UNAVAILABLE",
+      reason: "response_blocked_or_empty",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (
+    error instanceof GoogleGenerativeAIFetchError ||
+    name.includes("Fetch") ||
+    message.includes("fetch") ||
+    message.includes("network") ||
+    message.includes("econnreset") ||
+    message.includes("enotfound") ||
+    message.includes("etimedout")
+  ) {
+    return {
+      code: "OCR_NETWORK_FAILURE",
+      reason: "network_failure",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  if (error instanceof GoogleGenerativeAIRequestInputError || status === 400) {
+    return {
+      code: "OCR_REQUEST_INVALID",
+      reason: "invalid_internal_request",
+      statusCode: 503,
+      upstreamStatus: status,
+      upstreamReason,
+      errorName: name || error?.constructor?.name,
+    };
+  }
+
+  return {
+    code: "OCR_UNEXPECTED_ERROR",
+    reason: "unexpected_internal_error",
+    statusCode: 503,
+    upstreamStatus: status,
+    upstreamReason,
+    errorName: name || error?.constructor?.name,
+  };
+};
+
+const logDigitalIdDiagnostic = (
+  reason: string,
+  context: {
+    code?: string;
+    model?: string;
+    modelSource?: string;
+    apiVersion?: string;
+    timeoutMs?: number;
+    keySource?: string;
+    mimeType?: ImageKind;
+    fileSizeBytes?: number;
+    dimensions?: ImageDimensions | null;
+    upstreamStatus?: number;
+    upstreamReason?: string;
+    errorName?: string;
+    responseSummary?: {
+      candidateCount?: number;
+      finishReason?: string;
+      promptBlockReason?: string;
+      textLength?: number;
+    };
+  } = {}
+) => {
+  console.warn("[digital-id] screening diagnostic", {
+    reason,
+    code: context.code,
+    model: context.model || DEFAULT_OCR_MODEL,
+    modelSource: context.modelSource,
+    apiVersion: context.apiVersion || GEMINI_API_VERSION,
+    timeoutMs: context.timeoutMs,
+    keySource: context.keySource,
+    mimeType: context.mimeType,
+    fileSizeBytes: context.fileSizeBytes,
+    dimensions: context.dimensions,
+    upstreamStatus: context.upstreamStatus,
+    upstreamReason: context.upstreamReason,
+    errorName: context.errorName,
+    responseSummary: context.responseSummary,
+  });
+};
 
 const attemptsByKey = new Map<string, number[]>();
 const passedVerifications = new Map<string, VerificationRecord>();
@@ -226,33 +496,31 @@ const countMatches = (text: string, patterns: RegExp[]) =>
   patterns.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
 
 const useLocalImageCheckOnly = () =>
-  ["local", "local-image-check", "image-precheck"].includes(DIGITAL_ID_VERIFICATION_MODE.toLowerCase());
+  ["local", "local-image-check", "image-precheck"].includes(getDigitalIdVerificationMode().toLowerCase());
 
-const timeoutAfter = <T>(promise: Promise<T>, timeoutMs: number) =>
-  new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () =>
-        reject(
-          new DigitalIdValidationError(
-            "Digital ID screening is temporarily unavailable. Please try again later.",
-            503,
-            "OCR_TIMEOUT"
-          )
-        ),
-      timeoutMs
-    );
+const getGenerationConfig = (model: string) => {
+  const config: {
+    temperature?: number;
+    maxOutputTokens: number;
+    responseMimeType: string;
+  } = {
+    maxOutputTokens: MAX_OCR_OUTPUT_TOKENS,
+    responseMimeType: "application/json",
+  };
 
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      }
-    );
-  });
+  if (!model.replace(/^models\//, "").startsWith("gemini-3")) {
+    config.temperature = 0;
+  }
+
+  return config;
+};
+
+const summarizeGeminiResponse = (response: any, textLength?: number) => ({
+  candidateCount: Array.isArray(response?.candidates) ? response.candidates.length : undefined,
+  finishReason: response?.candidates?.[0]?.finishReason,
+  promptBlockReason: response?.promptFeedback?.blockReason,
+  textLength,
+});
 
 const scoreDigitalIdAnalysis = (analysis: GeminiDigitalIdAnalysis) => {
   const text = normalizeText(analysis.visibleTextSample);
@@ -328,29 +596,44 @@ const scoreDigitalIdAnalysis = (analysis: GeminiDigitalIdAnalysis) => {
   };
 };
 
-const analyzeWithGemini = async (file: DigitalIdUploadFile, mimeType: ImageKind) => {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || "";
+const analyzeWithGemini = async (
+  file: DigitalIdUploadFile,
+  mimeType: ImageKind,
+  dimensions: ImageDimensions | null
+) => {
+  const { apiKey, source: keySource } = getGeminiApiKey();
+  const { model: ocrModel, source: modelSource } = getOcrModel();
+  const timeoutMs = getOcrTimeoutMs();
+  const logContext = {
+    model: ocrModel,
+    modelSource,
+    apiVersion: GEMINI_API_VERSION,
+    timeoutMs,
+    keySource,
+    mimeType,
+    fileSizeBytes: file.size,
+    dimensions,
+  };
 
   if (!apiKey) {
-    throw new DigitalIdValidationError(
-      "Digital ID screening is temporarily unavailable. Please try again later.",
-      503,
-      "OCR_UNAVAILABLE"
-    );
+    logDigitalIdDiagnostic("missing_api_key", { ...logContext, code: "OCR_MISSING_API_KEY" });
+    throw createTemporaryUnavailableError("OCR_MISSING_API_KEY");
   }
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: OCR_MODEL,
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 180,
-        responseMimeType: "application/json",
-      } as any,
-    });
+    const model = genAI.getGenerativeModel(
+      {
+        model: ocrModel,
+        generationConfig: getGenerationConfig(ocrModel),
+      },
+      {
+        apiVersion: GEMINI_API_VERSION,
+        timeout: timeoutMs,
+      }
+    );
 
-    const result = await timeoutAfter(model.generateContent([
+    const result = await model.generateContent([
       {
         text: [
           "You are screening an uploaded image for Berenda account signup.",
@@ -369,17 +652,40 @@ const analyzeWithGemini = async (file: DigitalIdUploadFile, mimeType: ImageKind)
           data: file.buffer.toString("base64"),
         },
       },
-    ]), OCR_TIMEOUT_MS);
+    ]);
 
-    return extractJson(result.response.text());
+    const responseText = result.response.text();
+
+    try {
+      return extractJson(responseText);
+    } catch {
+      logDigitalIdDiagnostic("malformed_gemini_response", {
+        ...logContext,
+        code: "OCR_MALFORMED_RESPONSE",
+        responseSummary: summarizeGeminiResponse(result.response, responseText.length),
+      });
+      throw createTemporaryUnavailableError("OCR_MALFORMED_RESPONSE");
+    }
   } catch (error) {
-    if (error instanceof DigitalIdValidationError) throw error;
+    if (error instanceof DigitalIdValidationError) {
+      if (error.code !== "OCR_MALFORMED_RESPONSE") {
+        logDigitalIdDiagnostic(error.code === "OCR_TIMEOUT" ? "timeout" : "digital_id_service_error", {
+          ...logContext,
+          code: error.code,
+        });
+      }
+      throw error;
+    }
 
-    throw new DigitalIdValidationError(
-      "Digital ID screening is temporarily unavailable. Please try again later.",
-      503,
-      "OCR_UNAVAILABLE"
-    );
+    const diagnostic = classifyGeminiError(error);
+    logDigitalIdDiagnostic(diagnostic.reason, {
+      ...logContext,
+      code: diagnostic.code,
+      upstreamStatus: diagnostic.upstreamStatus,
+      upstreamReason: diagnostic.upstreamReason,
+      errorName: diagnostic.errorName,
+    });
+    throw createTemporaryUnavailableError(diagnostic.code, diagnostic.statusCode);
   }
 };
 
@@ -401,7 +707,7 @@ export const verifyDigitalIdImage = async (file: DigitalIdUploadFile, email: str
     throw new DigitalIdValidationError("Please enter your email before verifying your Digital ID.");
   }
 
-  const { kind } = validateImage(file);
+  const { kind, dimensions } = validateImage(file);
 
   if (useLocalImageCheckOnly()) {
     return {
@@ -412,7 +718,7 @@ export const verifyDigitalIdImage = async (file: DigitalIdUploadFile, email: str
     };
   }
 
-  const analysis = await analyzeWithGemini(file, kind);
+  const analysis = await analyzeWithGemini(file, kind, dimensions);
   const scoring = scoreDigitalIdAnalysis(analysis);
 
   if (scoring.tooLittleText || !analysis.readable) {
